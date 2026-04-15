@@ -114,19 +114,19 @@ async def ingest_deals_for_zip(zip_code: str):
         flipp_deals = await fetch_all_deals_for_zip(zip_code)
         raw_deals.extend(flipp_deals)
         logger.info(f"Flipp: {len(flipp_deals)} deals for {zip_code}")
-        update_scraper_status("flipp", len(flipp_deals))
+        await update_scraper_status("flipp", len(flipp_deals))
     except Exception as e:
         logger.error(f"Flipp fetch failed for {zip_code}: {e}")
-        update_scraper_status("flipp", 0, error=str(e))
+        await update_scraper_status("flipp", 0, error=str(e))
 
     try:
         heb_deals = await scrape_heb_deals(zip_code)
         raw_deals.extend(heb_deals)
         logger.info(f"HEB: {len(heb_deals)} deals for {zip_code}")
-        update_scraper_status("heb", len(heb_deals))
+        await update_scraper_status("heb", len(heb_deals))
     except Exception as e:
         logger.error(f"HEB scrape failed for {zip_code}: {e}")
-        update_scraper_status("heb", 0, error=str(e))
+        await update_scraper_status("heb", 0, error=str(e))
 
     for scraper_fn, chain_name, scraper_key in [
         (scrape_walmart_deals, "Walmart", "walmart"),
@@ -141,10 +141,10 @@ async def ingest_deals_for_zip(zip_code: str):
             chain_deals = await scraper_fn(zip_code)
             raw_deals.extend(chain_deals)
             logger.info(f"{chain_name}: {len(chain_deals)} deals for {zip_code}")
-            update_scraper_status(scraper_key, len(chain_deals))
+            await update_scraper_status(scraper_key, len(chain_deals))
         except Exception as e:
             logger.error(f"{chain_name} scrape failed for {zip_code}: {e}")
-            update_scraper_status(scraper_key, 0, error=str(e))
+            await update_scraper_status(scraper_key, 0, error=str(e))
 
     if not raw_deals:
         logger.warning(f"No deals fetched for {zip_code}")

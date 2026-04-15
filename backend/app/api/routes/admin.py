@@ -5,21 +5,21 @@ Trigger ingestion manually without waiting for the Sunday cron.
 from fastapi import APIRouter, BackgroundTasks, HTTPException
 from pydantic import BaseModel
 
+from app.core.redis import get_redis
+
 router = APIRouter()
 
-# In-memory registry of last-run scraper results.
-# Populated by the ingestion pipeline via update_scraper_status().
-_scraper_status: dict[str, dict] = {}
 
-
-def update_scraper_status(scraper_name: str, count: int, error: str | None = None) -> None:
-    """Called by the ingestion pipeline after each scraper run."""
+async def update_scraper_status(scraper_name: str, count: int, error: str | None = None) -> None:
+    """Write scraper result to Redis so both the API and worker containers can read it."""
+    import json
     from datetime import datetime, timezone
-    _scraper_status[scraper_name] = {
+    redis = await get_redis()
+    await redis.hset("scraper_status", scraper_name, json.dumps({
         "last_run": datetime.now(timezone.utc).isoformat(),
         "count": count,
         "error": error,
-    }
+    }))
 
 
 class IngestRequest(BaseModel):
@@ -61,11 +61,11 @@ async def flush_cache():
 
 @router.get("/scraper-status")
 async def scraper_status():
-    """Return the last-run result count for each scraper.
-
-    Populated during ingestion — empty until the first ingest run since startup.
-    """
-    return {"scrapers": _scraper_status}
+    """Return the last-run result count for each scraper (read from Redis)."""
+    import json
+    redis = await get_redis()
+    raw = await redis.hgetall("scraper_status")
+    return {"scrapers": {k: json.loads(v) for k, v in raw.items()}}
 
 
 @router.post("/recategorize")
