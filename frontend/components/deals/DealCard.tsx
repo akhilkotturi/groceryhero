@@ -32,8 +32,9 @@ function ScoreBadge({ score }: { score: number }) {
 export function DealCard({ deal, index = 0 }: DealCardProps) {
   const [imgError, setImgError] = useState(false);
   const { openModal } = useGroceryStore();
-  const { isInPlan, addDeal, removeDeal } = usePlanStore();
-  const inPlan = isInPlan(deal.id);
+  const inPlan = usePlanStore((s) => s.dealIds.includes(deal.id));
+  const addDeal = usePlanStore((s) => s.addDeal);
+  const removeDeal = usePlanStore((s) => s.removeDeal);
   const displayPrice = deal.sale_price ?? deal.unit_price;
   const hasDiscount = deal.discount_pct && deal.discount_pct > 0;
 
@@ -66,6 +67,7 @@ export function DealCard({ deal, index = 0 }: DealCardProps) {
 
       {/* + Plan / ✓ Plan button */}
       <button
+        aria-label={inPlan ? "Remove from plan" : "Add to plan"}
         onClick={(e) => {
           e.stopPropagation();
           inPlan ? removeDeal(deal.id) : addDeal(deal);
