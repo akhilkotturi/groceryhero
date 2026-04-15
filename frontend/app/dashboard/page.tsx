@@ -1,5 +1,5 @@
 "use client";
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useMemo } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { motion, AnimatePresence } from "framer-motion";
 import {
@@ -40,7 +40,10 @@ async function geocodeZip(zip: string): Promise<{ lat: number; lng: number } | n
     const data = await res.json();
     const place = data.places?.[0];
     if (!place) return null;
-    return { lat: parseFloat(place.latitude), lng: parseFloat(place.longitude) };
+    const lat = parseFloat(place.latitude);
+    const lng = parseFloat(place.longitude);
+    if (Number.isNaN(lat) || Number.isNaN(lng)) return null;
+    return { lat, lng };
   } catch {
     return null;
   }
@@ -80,8 +83,12 @@ export default function DashboardPage() {
   const [planLoading, setPlanLoading] = useState(false);
   const [planError, setPlanError] = useState<string | null>(null);
 
+  const handleStoreClick = useCallback((s: Store) => setSelectedStore(s), []);
+
   const applyLocation = useCallback((coords: { lat: number; lng: number }, zip?: string) => {
-    setLocation(coords);
+    setLocation((prev) =>
+      prev.lat === coords.lat && prev.lng === coords.lng ? prev : coords
+    );
     if (zip) setDisplayZip(zip);
     queryClient.invalidateQueries({ queryKey: ["deals"] });
     queryClient.invalidateQueries({ queryKey: ["stores"] });
@@ -93,9 +100,10 @@ export default function DashboardPage() {
         navigator.geolocation.getCurrentPosition(
           (pos) => applyLocation({ lat: pos.coords.latitude, lng: pos.coords.longitude }),
           async () => {
-            if (user?.zip_code) {
-              const coords = await geocodeZip(user.zip_code);
-              if (coords) applyLocation(coords, user.zip_code);
+            const zipCode = useAuthStore.getState().user?.zip_code;
+            if (zipCode) {
+              const coords = await geocodeZip(zipCode);
+              if (coords) applyLocation(coords, zipCode);
             }
           },
           { timeout: 8000 }
@@ -122,7 +130,10 @@ export default function DashboardPage() {
     try {
       const { data } = await api.patch("/api/users/me", { zip_code: z });
       setUser(data);
-    } catch {}
+    } catch {
+      // Zip applied locally; server persistence failed — non-blocking
+      console.warn("Failed to persist zip_code to server");
+    }
     try { await api.post("/api/admin/ingest", { zip_codes: [z] }); } catch {}
   };
 
@@ -187,21 +198,24 @@ export default function DashboardPage() {
     : rawDeals;
 
   // Deal counts + avg score per store (from nearby feed, not affected by search)
-  const allNearbyDeals: Deal[] = nearbyData?.deals ?? [];
-  const dealCountByStore: Record<string, number> = {};
-  const scoreSumByStore: Record<string, number> = {};
-  const scoreCountByStore: Record<string, number> = {};
-  for (const d of allNearbyDeals) {
-    dealCountByStore[d.store_id] = (dealCountByStore[d.store_id] ?? 0) + 1;
-    if (d.deal_score != null) {
-      scoreSumByStore[d.store_id] = (scoreSumByStore[d.store_id] ?? 0) + d.deal_score;
-      scoreCountByStore[d.store_id] = (scoreCountByStore[d.store_id] ?? 0) + 1;
+  const { dealCountByStore, avgScoreByStore } = useMemo(() => {
+    const allDeals: Deal[] = nearbyData?.deals ?? [];
+    const countMap: Record<string, number> = {};
+    const scoreSum: Record<string, number> = {};
+    const scoreCount: Record<string, number> = {};
+    for (const d of allDeals) {
+      countMap[d.store_id] = (countMap[d.store_id] ?? 0) + 1;
+      if (d.deal_score != null) {
+        scoreSum[d.store_id] = (scoreSum[d.store_id] ?? 0) + d.deal_score;
+        scoreCount[d.store_id] = (scoreCount[d.store_id] ?? 0) + 1;
+      }
     }
-  }
-  function avgScore(storeId: string): number {
-    const cnt = scoreCountByStore[storeId] ?? 0;
-    return cnt > 0 ? (scoreSumByStore[storeId] ?? 0) / cnt : 0;
-  }
+    const avgMap: Record<string, number> = {};
+    for (const id of Object.keys(scoreSum)) {
+      avgMap[id] = scoreSum[id] / scoreCount[id];
+    }
+    return { dealCountByStore: countMap, avgScoreByStore: avgMap };
+  }, [nearbyData]);
 
   // ── Plan ─────────────────────────────────────────────────────────────────
 
@@ -224,13 +238,20 @@ export default function DashboardPage() {
   }
 
   const planDeals = planStore.deals;
-  const planStoreIds = new Set(planDeals.map((d) => d.store_id));
+  const planStoreIds = useMemo(
+    () => new Set(planDeals.map((d) => d.store_id)),
+    [planDeals]
+  );
   const planStoreCount = planStoreIds.size;
   const planEstTotal = planDeals.reduce((s, d) => s + (d.sale_price ?? d.unit_price ?? 0), 0);
 
-  const planRouteStores: Store[] = planResult
-    ? planResult.store_plans.map((sp) => sp.store)
-    : stores.filter((s) => planStoreIds.has(s.id));
+  const planRouteStores: Store[] = useMemo(
+    () =>
+      planResult
+        ? planResult.store_plans.map((sp) => sp.store)
+        : stores.filter((s) => planStoreIds.has(s.id)),
+    [planResult, stores, planStoreIds]
+  );
 
   return (
     <div className="h-screen w-screen bg-[var(--bg)] flex flex-col overflow-hidden">
@@ -336,12 +357,13 @@ export default function DashboardPage() {
 
         {stores.map((store) => {
           const count = dealCountByStore[store.id] ?? 0;
-          const score = avgScore(store.id);
+          const score = avgScoreByStore[store.id] ?? 0;
           const dotColor = score >= 75 ? "bg-[var(--green)]" : score >= 40 ? "bg-yellow-400" : "bg-[var(--text-muted)]";
           const isSelected = selectedStore?.id === store.id;
           return (
             <button
               key={store.id}
+              aria-pressed={isSelected}
               onClick={() => setSelectedStore(isSelected ? null : store)}
               className={cn(
                 "shrink-0 flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-medium transition-colors",
@@ -396,6 +418,7 @@ export default function DashboardPage() {
                   {CATEGORIES.map((cat) => (
                     <button
                       key={cat}
+                      aria-pressed={category === cat}
                       onClick={() => setCategory(cat)}
                       className={cn(
                         "shrink-0 px-2.5 py-0.5 rounded-full text-xs capitalize transition-colors",
@@ -412,6 +435,7 @@ export default function DashboardPage() {
                   {SORT_OPTIONS.map((opt) => (
                     <button
                       key={opt.value}
+                      aria-pressed={sortBy === opt.value}
                       onClick={() => setSortBy(opt.value)}
                       className={cn(
                         "px-2.5 py-0.5 rounded-full text-xs transition-colors",
@@ -531,7 +555,7 @@ export default function DashboardPage() {
                       planResult={planResult}
                       onRemove={(id) => {
                         planStore.removeDeal(id);
-                        // If plan result is stale after removal, clear it
+                        // Always clear plan result when a deal is removed — it reflects the previous selection
                         if (planResult) setPlanResult(null);
                       }}
                     />
@@ -549,7 +573,7 @@ export default function DashboardPage() {
             deals={rawDeals}
             userLat={location.lat}
             userLng={location.lng}
-            onStoreClick={activeTab === "browse" ? (s) => setSelectedStore(s) : undefined}
+            onStoreClick={activeTab === "browse" ? handleStoreClick : undefined}
             planStoreIds={activeTab === "plan" && planStoreIds.size > 0 ? planStoreIds : undefined}
             planRoute={activeTab === "plan" ? planRouteStores : undefined}
           />
