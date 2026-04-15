@@ -6,10 +6,12 @@ button on deal cards. This endpoint receives their deal IDs, fetches them from
 the DB, parses effective prices with the rule-based DealParser, groups by store,
 and returns a structured plan. No Groq call needed.
 """
+from datetime import datetime, timezone
+
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+from sqlalchemy import and_, or_, select
 from sqlalchemy.orm import selectinload
 
 from app.db.session import get_db
@@ -28,8 +30,8 @@ router = APIRouter()
 
 class PlanRequest(BaseModel):
     deal_ids: list[str]
-    lat: float
-    lng: float
+    lat: float   # reserved for future distance-based store sorting
+    lng: float   # reserved for future distance-based store sorting
 
 
 class PlanMatch(BaseModel):
@@ -67,10 +69,17 @@ async def create_plan(
         raise HTTPException(status_code=400, detail="deal_ids must not be empty")
 
     # ── 1. Fetch all requested deals (with store eager-loaded) ────────────────
+    now = datetime.now(timezone.utc)
     result = await db.execute(
         select(Deal)
         .options(selectinload(Deal.store))
-        .where(Deal.id.in_(req.deal_ids))
+        .where(
+            and_(
+                Deal.id.in_(req.deal_ids),
+                Deal.is_active == True,
+                or_(Deal.valid_to.is_(None), Deal.valid_to >= now),
+            )
+        )
     )
     deals: list[Deal] = result.scalars().all()
 
