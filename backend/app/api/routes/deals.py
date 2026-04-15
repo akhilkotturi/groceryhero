@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, and_, or_
 from sqlalchemy.orm import selectinload
@@ -16,6 +16,12 @@ from app.models.user import User
 router = APIRouter()
 
 CACHE_TTL = 60 * 30  # 30 minutes
+
+
+def _escape_ilike(value: str) -> str:
+    """Escape ILIKE metacharacters (%, _, \\) to prevent pattern injection."""
+    import re
+    return re.sub(r"([%_\\])", r"\\\1", value)
 
 
 @router.get("/nearby", response_model=DealsResponse)
@@ -103,6 +109,7 @@ async def search_deals(
     lat_delta = radius_miles / 69.0
     lng_delta = radius_miles / (69.0 * math.cos(math.radians(lat)))
     now = datetime.now(timezone.utc)
+    escaped_q = _escape_ilike(q)
 
     query = (
         select(Deal)
@@ -115,17 +122,18 @@ async def search_deals(
                 Deal.is_active == True,
                 or_(Deal.valid_to.is_(None), Deal.valid_to >= now),
                 or_(
-                    Deal.normalized_name.ilike(f"%{q}%"),
-                    Deal.raw_title.ilike(f"%{q}%"),
+                    Deal.normalized_name.ilike(f"%{escaped_q}%"),
+                    Deal.raw_title.ilike(f"%{escaped_q}%"),
                 ),
             )
         )
         .order_by(Deal.deal_score.desc().nullslast())
-        .limit(per_page)
     )
 
     if category:
         query = query.where(Deal.category == category)
+
+    query = query.limit(per_page)
 
     result = await db.execute(query)
     deals = result.scalars().all()
@@ -146,6 +154,5 @@ async def get_deal(
     result = await db.execute(select(Deal).where(Deal.id == deal_id))
     deal = result.scalar_one_or_none()
     if not deal:
-        from fastapi import HTTPException
         raise HTTPException(status_code=404, detail="Deal not found")
     return DealOut.model_validate(deal)
