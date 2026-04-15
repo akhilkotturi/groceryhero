@@ -345,6 +345,7 @@ export default function DashboardPage() {
       <div className="shrink-0 border-b border-[var(--border)] px-4 py-2 flex items-center gap-2 overflow-x-auto scrollbar-none">
         <button
           onClick={() => setSelectedStore(null)}
+          aria-pressed={!selectedStore}
           className={cn(
             "shrink-0 px-3 py-1 rounded-full text-xs font-medium transition-colors",
             !selectedStore
