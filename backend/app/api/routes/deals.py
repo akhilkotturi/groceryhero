@@ -1,0 +1,151 @@
+from fastapi import APIRouter, Depends, Query
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select, and_, or_
+from sqlalchemy.orm import selectinload
+from datetime import datetime, timezone
+import json
+import math
+
+from app.db.session import get_db
+from app.models.deal import Deal, Store
+from app.schemas.deal import DealsResponse, DealOut, StoreOut, SearchResponse
+from app.core.deps import get_current_user
+from app.core.redis import get_redis
+from app.models.user import User
+
+router = APIRouter()
+
+CACHE_TTL = 60 * 30  # 30 minutes
+
+
+@router.get("/nearby", response_model=DealsResponse)
+async def get_nearby_deals(
+    lat: float = Query(..., description="User latitude"),
+    lng: float = Query(..., description="User longitude"),
+    radius_miles: float = Query(10.0, le=50),
+    category: str | None = Query(None),
+    page: int = Query(1, ge=1),
+    per_page: int = Query(20, le=100),
+    sort_by: str = Query("deal_score", enum=["deal_score", "discount_pct", "sale_price"]),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    cache_key = f"deals:nearby:{lat:.3f}:{lng:.3f}:{radius_miles}:{category}:{page}:{sort_by}"
+    redis = await get_redis()
+    cached = await redis.get(cache_key)
+    if cached:
+        return DealsResponse(**json.loads(cached))
+
+    # Rough bounding box (1 degree lat ≈ 69 miles; longitude shrinks with cos(lat))
+    lat_delta = radius_miles / 69.0
+    lng_delta = radius_miles / (69.0 * math.cos(math.radians(lat)))
+
+    now = datetime.now(timezone.utc)
+    query = (
+        select(Deal)
+        .join(Store)
+        .options(selectinload(Deal.store))
+        .where(
+            and_(
+                Store.latitude.between(lat - lat_delta, lat + lat_delta),
+                Store.longitude.between(lng - lng_delta, lng + lng_delta),
+                Deal.is_active == True,
+                or_(Deal.valid_to.is_(None), Deal.valid_to >= now),
+            )
+        )
+    )
+
+    if category:
+        query = query.where(Deal.category == category)
+
+    # Sorting
+    sort_col = getattr(Deal, sort_by, Deal.deal_score)
+    query = query.order_by(sort_col.desc().nullslast())
+
+    # Pagination
+    total_result = await db.execute(query)
+    total = len(total_result.scalars().all())
+
+    query = query.offset((page - 1) * per_page).limit(per_page)
+    result = await db.execute(query)
+    deals = result.scalars().all()
+
+    response = DealsResponse(
+        deals=[DealOut.model_validate(d) for d in deals],
+        total=total,
+        page=page,
+        per_page=per_page,
+    )
+
+    await redis.setex(cache_key, CACHE_TTL, response.model_dump_json())
+    return response
+
+
+@router.get("/categories")
+async def get_categories(db: AsyncSession = Depends(get_db)):
+    result = await db.execute(
+        select(Deal.category).distinct().where(Deal.category.is_not(None))
+    )
+    return {"categories": [r[0] for r in result.all()]}
+
+
+@router.get("/search", response_model=SearchResponse)
+async def search_deals(
+    q: str = Query(..., min_length=2, description="Search query"),
+    lat: float = Query(...),
+    lng: float = Query(...),
+    radius_miles: float = Query(10.0, le=50),
+    category: str | None = Query(None),
+    per_page: int = Query(50, le=100),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    lat_delta = radius_miles / 69.0
+    lng_delta = radius_miles / (69.0 * math.cos(math.radians(lat)))
+    now = datetime.now(timezone.utc)
+
+    query = (
+        select(Deal)
+        .join(Store)
+        .options(selectinload(Deal.store))
+        .where(
+            and_(
+                Store.latitude.between(lat - lat_delta, lat + lat_delta),
+                Store.longitude.between(lng - lng_delta, lng + lng_delta),
+                Deal.is_active == True,
+                or_(Deal.valid_to.is_(None), Deal.valid_to >= now),
+                or_(
+                    Deal.normalized_name.ilike(f"%{q}%"),
+                    Deal.raw_title.ilike(f"%{q}%"),
+                ),
+            )
+        )
+        .order_by(Deal.deal_score.desc().nullslast())
+        .limit(per_page)
+    )
+
+    if category:
+        query = query.where(Deal.category == category)
+
+    result = await db.execute(query)
+    deals = result.scalars().all()
+
+    return SearchResponse(
+        deals=[DealOut.model_validate(d) for d in deals],
+        total=len(deals),
+        query=q,
+    )
+
+
+@router.get("/{deal_id}", response_model=DealOut)
+async def get_deal(
+    deal_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    result = await db.execute(select(Deal).where(Deal.id == deal_id))
+    deal = result.scalar_one_or_none()
+    if not deal:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=404, detail="Deal not found")
+    return DealOut.model_validate(deal)
