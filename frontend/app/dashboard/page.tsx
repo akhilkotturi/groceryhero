@@ -12,6 +12,9 @@ import dynamic from "next/dynamic";
 import { DealCard } from "@/components/deals/DealCard";
 import { GroceryList } from "@/components/deals/GroceryList";
 import { DealModal } from "@/components/deals/DealModal";
+import { AskBar } from "@/components/deals/AskBar";
+import { AskResults } from "@/components/deals/AskResults";
+import type { AskResponse } from "@/types";
 import { useAuthStore } from "@/lib/store";
 import { useGroceryStore } from "@/lib/grocery-store";
 import { usePlanStore } from "@/lib/plan-store";
@@ -82,6 +85,7 @@ export default function DashboardPage() {
   const [planResult, setPlanResult] = useState<PlanResponse | null>(null);
   const [planLoading, setPlanLoading] = useState(false);
   const [planError, setPlanError] = useState<string | null>(null);
+  const [askResult, setAskResult] = useState<AskResponse | null>(null);
 
   const handleStoreClick = useCallback((s: Store) => setSelectedStore(s), []);
 
@@ -451,6 +455,16 @@ export default function DashboardPage() {
                 </div>
               </div>
 
+              {/* AI Ask bar */}
+              <AskBar
+                onResult={setAskResult}
+                onClear={() => setAskResult(null)}
+                hasResult={askResult !== null}
+              />
+
+              {/* AI results (shown above deal grid when active) */}
+              {askResult && <AskResults result={askResult} />}
+
               {/* Store filter banner */}
               {selectedStore && (
                 <div className="px-4 py-2 bg-[var(--green-glow)] border-b border-[var(--border)] flex items-center justify-between shrink-0">
@@ -575,6 +589,7 @@ export default function DashboardPage() {
             userLat={location.lat}
             userLng={location.lng}
             onStoreClick={activeTab === "browse" ? handleStoreClick : undefined}
+            selectedStoreId={activeTab === "browse" ? (selectedStore?.id ?? null) : null}
             planStoreIds={activeTab === "plan" && planStoreIds.size > 0 ? planStoreIds : undefined}
             planRoute={activeTab === "plan" ? planRouteStores : undefined}
           />
