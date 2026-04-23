@@ -29,6 +29,7 @@ from app.services.scraper_sams_club import scrape_sams_club_deals
 from app.services.scraper_indian_grocery import scrape_patel_brothers_deals, scrape_india_bazaar_deals
 from app.services.normalizer import batch_normalize
 from app.services.scorer import score_batch
+from app.services.embeddings import embed_batch, build_embed_text
 from app.api.routes.admin import update_scraper_status
 from sqlalchemy import select, update, and_
 import httpx
@@ -84,18 +85,24 @@ def _geocode_zip_sync(zip_code: str) -> tuple[float, float, str, str]:
         return 0.0, 0.0, "", ""
 
 
-async def ensure_store_for_merchant(db, merchant_name: str, zip_code: str) -> str:
-    """Create a fallback store row for a merchant when we don't have a match yet."""
-    latitude, longitude, city, state = await asyncio.to_thread(_geocode_zip_sync, zip_code)
+async def ensure_store_for_merchant(
+    db,
+    merchant_name: str,
+    zip_code: str,
+    overrides: dict | None = None,
+) -> str:
+    """Create a store row for a merchant. Uses real coordinates from overrides when available."""
+    zip_lat, zip_lng, zip_city, zip_state = await asyncio.to_thread(_geocode_zip_sync, zip_code)
+    ov = overrides or {}
     store = Store(
         chain=merchant_name or "Unknown",
-        name=merchant_name or f"Store {zip_code}",
-        address="Unknown",
-        city=city or "",
-        state=state or "",
+        name=ov.get("name", merchant_name) or f"Store {zip_code}",
+        address=ov.get("address", "Unknown"),
+        city=ov.get("city", zip_city or ""),
+        state=ov.get("state", zip_state or ""),
         zip_code=zip_code,
-        latitude=latitude,
-        longitude=longitude,
+        latitude=ov.get("lat") if ov.get("lat") is not None else zip_lat,
+        longitude=ov.get("lng") if ov.get("lng") is not None else zip_lng,
         is_active=True,
     )
     db.add(store)
@@ -156,6 +163,16 @@ async def ingest_deals_for_zip(zip_code: str):
     # 3. Score
     scored = score_batch(normalized)
 
+    # 3b. Embed deals (run in executor — sentence-transformers is sync)
+    try:
+        embed_texts = [build_embed_text(d) for d in scored]
+        embeddings = await embed_batch(embed_texts)
+        for deal_data, emb in zip(scored, embeddings):
+            deal_data["embedding"] = emb
+        logger.info(f"Embedded {len(embeddings)} deals for {zip_code}")
+    except Exception as e:
+        logger.warning(f"Embedding failed for {zip_code}: {e} — continuing without embeddings")
+
     # 4. Upsert into DB
     async with AsyncSessionLocal() as db:
         inserted = 0
@@ -164,9 +181,16 @@ async def ingest_deals_for_zip(zip_code: str):
             deal_data.pop("_flyer_id", None)
             deal_data.pop("store_id", None)
 
+            # Extract real store coordinates when the scraper provides them
+            store_overrides = {
+                key[7:]: deal_data.pop(key)
+                for key in list(deal_data.keys())
+                if key.startswith("_store_")
+            }
+
             store_id = await get_store_id_by_merchant(db, merchant, zip_code)
             if not store_id:
-                store_id = await ensure_store_for_merchant(db, merchant, zip_code)
+                store_id = await ensure_store_for_merchant(db, merchant, zip_code, overrides=store_overrides)
 
             # Upsert by source_id
             source_id = deal_data.get("source_id")
