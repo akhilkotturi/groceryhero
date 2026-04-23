@@ -50,3 +50,23 @@ class SearchResponse(BaseModel):
     deals: list[DealOut]
     total: int
     query: str
+
+
+# ── RAG Ask ─────────────────────────────────────────────────────────────────
+
+class AskRequest(BaseModel):
+    query: str
+
+
+class AskDealResult(BaseModel):
+    deal_id: str
+    deal: Optional[DealOut] = None
+    relevance: str = ""
+
+
+class AskResponse(BaseModel):
+    answer: str
+    deals: list[AskDealResult]
+    actions_taken: list[str]
+    suggested_actions: list[dict]
+    turns: int

@@ -6,12 +6,17 @@ from datetime import datetime, timezone
 import json
 import math
 
+import hashlib
+import logging
 from app.db.session import get_db
 from app.models.deal import Deal, Store
 from app.schemas.deal import DealsResponse, DealOut, StoreOut, SearchResponse
+from app.schemas.deal import AskRequest, AskResponse, AskDealResult
 from app.core.deps import get_current_user
 from app.core.redis import get_redis
 from app.models.user import User
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
@@ -143,6 +148,55 @@ async def search_deals(
         total=len(deals),
         query=q,
     )
+
+
+@router.post("/ask", response_model=AskResponse)
+async def ask_deals(
+    request: AskRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    cache_key = f"ask:{current_user.id}:{hashlib.md5(request.query.encode()).hexdigest()[:16]}"
+    redis = await get_redis()
+    cached = await redis.get(cache_key)
+    if cached:
+        return AskResponse(**json.loads(cached))
+
+    try:
+        from app.services.rag import run_agent
+        agent_result = await run_agent(request.query, current_user.id, db)
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    except Exception as e:
+        logger.error("RAG agent error: %s", e)
+        raise HTTPException(status_code=503, detail="Local AI unavailable")
+
+    # Enrich deal references with full DealOut objects
+    enriched_deals: list[AskDealResult] = []
+    for ref in agent_result.get("deals", []):
+        deal_id = ref.get("deal_id", "")
+        relevance = ref.get("relevance", "")
+        if deal_id:
+            deal_row = await db.execute(
+                select(Deal).options(selectinload(Deal.store)).where(Deal.id == deal_id)
+            )
+            deal_obj = deal_row.scalar_one_or_none()
+            enriched_deals.append(AskDealResult(
+                deal_id=deal_id,
+                relevance=relevance,
+                deal=DealOut.model_validate(deal_obj) if deal_obj else None,
+            ))
+
+    response = AskResponse(
+        answer=agent_result.get("answer", ""),
+        deals=enriched_deals,
+        actions_taken=agent_result.get("actions_taken", []),
+        suggested_actions=agent_result.get("suggested_actions", []),
+        turns=agent_result.get("turns", 0),
+    )
+
+    await redis.setex(cache_key, 300, response.model_dump_json())
+    return response
 
 
 @router.get("/{deal_id}", response_model=DealOut)
