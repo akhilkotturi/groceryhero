@@ -81,3 +81,25 @@ export interface DealsFilters {
   per_page?: number;
   sort_by?: SortBy;
 }
+
+// ── RAG Ask ───────────────────────────────────────────────────────────────────
+
+export interface AskDealResult {
+  deal_id: string;
+  deal?: Deal;
+  relevance: string;
+}
+
+export interface AskSuggestedAction {
+  label: string;
+  action: string;
+  deal_ids: string[];
+}
+
+export interface AskResponse {
+  answer: string;
+  deals: AskDealResult[];
+  actions_taken: string[];
+  suggested_actions: AskSuggestedAction[];
+  turns: number;
+}
