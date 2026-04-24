@@ -156,12 +156,6 @@ async def ask_deals(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    cache_key = f"ask:{current_user.id}:{hashlib.md5(request.query.encode()).hexdigest()[:16]}"
-    redis = await get_redis()
-    cached = await redis.get(cache_key)
-    if cached:
-        return AskResponse(**json.loads(cached))
-
     try:
         from app.services.rag import run_agent
         agent_result = await run_agent(request.query, current_user.id, db)
@@ -187,16 +181,18 @@ async def ask_deals(
                 deal=DealOut.model_validate(deal_obj) if deal_obj else None,
             ))
 
-    response = AskResponse(
+    return AskResponse(
         answer=agent_result.get("answer", ""),
         deals=enriched_deals,
         actions_taken=agent_result.get("actions_taken", []),
         suggested_actions=agent_result.get("suggested_actions", []),
         turns=agent_result.get("turns", 0),
+        guardrail=agent_result.get("guardrail", {
+            "action": "allow",
+            "reason_code": "legacy_default",
+            "matched_terms": [],
+        }),
     )
-
-    await redis.setex(cache_key, 300, response.model_dump_json())
-    return response
 
 
 @router.get("/{deal_id}", response_model=DealOut)

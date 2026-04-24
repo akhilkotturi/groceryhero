@@ -96,10 +96,17 @@ export interface AskSuggestedAction {
   deal_ids: string[];
 }
 
+export interface AskGuardrail {
+  action: "allow" | "warn" | "block" | string;
+  reason_code: string;
+  matched_terms: string[];
+}
+
 export interface AskResponse {
   answer: string;
   deals: AskDealResult[];
   actions_taken: string[];
   suggested_actions: AskSuggestedAction[];
   turns: number;
+  guardrail: AskGuardrail;
 }

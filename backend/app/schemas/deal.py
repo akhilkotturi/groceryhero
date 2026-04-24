@@ -64,9 +64,16 @@ class AskDealResult(BaseModel):
     relevance: str = ""
 
 
+class AskGuardrail(BaseModel):
+    action: str  # allow | warn | block
+    reason_code: str
+    matched_terms: list[str] = []
+
+
 class AskResponse(BaseModel):
     answer: str
     deals: list[AskDealResult]
     actions_taken: list[str]
     suggested_actions: list[dict]
     turns: int
+    guardrail: AskGuardrail

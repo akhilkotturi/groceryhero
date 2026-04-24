@@ -23,11 +23,11 @@ async def run() -> None:
         )
         print("✓ embedding column added to deals table")
 
-        await conn.execute(
-            "CREATE INDEX IF NOT EXISTS deals_embedding_ivfflat_idx "
-            "ON deals USING ivfflat (embedding vector_cosine_ops) WITH (lists = 100);"
-        )
-        print("✓ IVFFlat index created (lists=100)")
+        # Skip IVFFlat index — approximate ANN with lists=100 on small tables
+        # only probes ~1% of rows by default, causing correct items to be missed.
+        # Exact sequential scan is faster and 100% accurate for datasets < 50k rows.
+        # Recreate an IVFFlat/HNSW index only when row count exceeds ~10k.
+        print("✓ Skipping IVFFlat index (exact scan is correct and fast for this dataset size)")
     finally:
         await conn.close()
 

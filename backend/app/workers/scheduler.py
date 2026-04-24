@@ -11,6 +11,8 @@ Pipeline:
 """
 import asyncio
 import logging
+import math
+import re
 from datetime import datetime, timezone
 from functools import lru_cache
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -52,48 +54,207 @@ async def get_active_zip_codes() -> list[str]:
         return zips if zips else SEED_ZIP_CODES
 
 
-async def get_store_id_by_merchant(db, merchant_name: str, zip_code: str) -> str | None:
-    """Match a merchant name to a store in our DB."""
-    result = await db.execute(
-        select(Store).where(
-            and_(
-                Store.chain.ilike(f"%{merchant_name}%"),
-                Store.zip_code == zip_code,
-                Store.is_active == True,
+async def get_store_id_by_merchant(
+    db,
+    merchant_name: str,
+    zip_code: str,
+    merchant_id: str | int | None = None,
+    coord_overrides: dict | None = None,
+) -> str | None:
+    """Match a merchant name to a store. Fixes bad coordinates (0,0) on each lookup."""
+    store = None
+
+    merchant_id_str = str(merchant_id) if merchant_id is not None else None
+    if merchant_id_str:
+        result = await db.execute(
+            select(Store).where(
+                and_(
+                    Store.flipp_merchant_id == merchant_id_str,
+                    Store.zip_code == zip_code,
+                    Store.is_active == True,
+                )
+            ).limit(1)
+        )
+        store = result.scalar_one_or_none()
+
+    if not store:
+        normalized = _normalize_chain_name(merchant_name)
+        result = await db.execute(
+            select(Store).where(
+                and_(
+                    Store.zip_code == zip_code,
+                    Store.is_active == True,
+                )
             )
-        ).limit(1)
+        )
+        candidates = result.scalars().all()
+        store = next((s for s in candidates if _normalize_chain_name(s.chain) == normalized), None)
+
+    if not store:
+        return None
+
+    zip_lat, zip_lng, _, _ = await asyncio.to_thread(_geocode_zip_sync, zip_code)
+
+    # Heal stores that were persisted with (0, 0) placeholder coordinates,
+    # or stores geocoded far away from their serving ZIP area.
+    far_from_zip = (
+        zip_lat != 0.0
+        and _haversine_miles(store.latitude, store.longitude, zip_lat, zip_lng) > 25
     )
-    store = result.scalar_one_or_none()
-    return store.id if store else None
+    if (store.latitude == 0.0 and store.longitude == 0.0) or far_from_zip:
+        ov = coord_overrides or {}
+        if ov.get("lat") is not None:
+            store.latitude = float(ov["lat"])
+            store.longitude = float(ov["lng"])
+        else:
+            geo = await asyncio.to_thread(_geocode_store_sync, merchant_name, zip_code)
+            if geo:
+                store.latitude, store.longitude = geo
+            else:
+                if zip_lat != 0.0:
+                    store.latitude, store.longitude = zip_lat, zip_lng
+
+    return store.id
 
 
 @lru_cache(maxsize=512)
 def _geocode_zip_sync(zip_code: str) -> tuple[float, float, str, str]:
-    """Resolve a ZIP code to approximate coordinates and location labels."""
+    """Resolve a ZIP code to (lat, lng, city, state). Tries zippopotam.us then Nominatim."""
+    # Primary: zippopotam.us
     try:
         response = httpx.get(f"https://api.zippopotam.us/us/{zip_code}", timeout=10.0)
         response.raise_for_status()
         payload = response.json()
         place = (payload.get("places") or [{}])[0]
-        return (
-            float(place.get("latitude", 0.0) or 0.0),
-            float(place.get("longitude", 0.0) or 0.0),
-            place.get("place name", ""),
-            place.get("state abbreviation", ""),
-        )
+        lat = float(place.get("latitude", 0.0) or 0.0)
+        lng = float(place.get("longitude", 0.0) or 0.0)
+        if lat != 0.0 and lng != 0.0:
+            return lat, lng, place.get("place name", ""), place.get("state abbreviation", "")
     except Exception:
-        return 0.0, 0.0, "", ""
+        pass
+
+    # Fallback: Nominatim postal code lookup
+    try:
+        response = httpx.get(
+            "https://nominatim.openstreetmap.org/search",
+            params={"postalcode": zip_code, "country": "us", "format": "json", "limit": 1},
+            headers={"User-Agent": "GroceryHero/1.0"},
+            timeout=8.0,
+        )
+        response.raise_for_status()
+        results = response.json()
+        if results:
+            return float(results[0]["lat"]), float(results[0]["lon"]), "", ""
+    except Exception:
+        pass
+
+    return 0.0, 0.0, "", ""
+
+
+@lru_cache(maxsize=1024)
+def _geocode_store_sync(merchant_name: str, zip_code: str) -> tuple[float, float] | None:
+    """Look up a real store location via Nominatim OSM constrained to ZIP vicinity."""
+    try:
+        zip_lat, zip_lng, _, _ = _geocode_zip_sync(zip_code)
+        viewbox = None
+        if zip_lat != 0.0 and zip_lng != 0.0:
+            # ~35x35 mile search box around the ZIP centroid.
+            dlat = 0.25
+            dlng = 0.25
+            viewbox = f"{zip_lng-dlng},{zip_lat-dlat},{zip_lng+dlng},{zip_lat+dlat}"
+
+        response = httpx.get(
+            "https://nominatim.openstreetmap.org/search",
+            params={
+                "q": merchant_name,
+                "postalcode": zip_code,
+                "format": "json",
+                "limit": 5,
+                "countrycodes": "us",
+                "addressdetails": "0",
+                **({"viewbox": viewbox, "bounded": 1} if viewbox else {}),
+            },
+            headers={"User-Agent": "GroceryHero/1.0"},
+            timeout=8.0,
+        )
+        response.raise_for_status()
+        results = response.json()
+        if results:
+            merchant_tokens = {
+                t for t in merchant_name.lower().replace("'", "").replace("-", " ").split()
+                if len(t) >= 3
+            }
+
+            best: tuple[float, float] | None = None
+            best_dist = float("inf")
+            for r in results:
+                lat = float(r["lat"])
+                lng = float(r["lon"])
+                if zip_lat != 0.0 and zip_lng != 0.0:
+                    dist = _haversine_miles(lat, lng, zip_lat, zip_lng)
+                    if dist > 25:
+                        continue
+                else:
+                    dist = 0.0
+
+                name_blob = (r.get("display_name") or "").lower().replace("'", "").replace("-", " ")
+                if merchant_tokens and not all(tok in name_blob for tok in merchant_tokens):
+                    continue
+
+                if dist < best_dist:
+                    best = (lat, lng)
+                    best_dist = dist
+
+            if best:
+                return best
+    except Exception:
+        pass
+    return None
+
+
+def _haversine_miles(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Great-circle distance between two points in miles."""
+    r = 3958.8
+    p1 = math.radians(lat1)
+    p2 = math.radians(lat2)
+    dp = math.radians(lat2 - lat1)
+    dl = math.radians(lon2 - lon1)
+    a = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
+    return 2 * r * math.asin(math.sqrt(a))
+
+
+def _normalize_chain_name(name: str) -> str:
+    """Canonicalize chain names for stable matching."""
+    if not name:
+        return ""
+    lowered = name.lower().replace("&", " and ")
+    lowered = re.sub(r"[^a-z0-9]+", " ", lowered)
+    lowered = re.sub(r"\s+", " ", lowered).strip()
+    return lowered
 
 
 async def ensure_store_for_merchant(
     db,
     merchant_name: str,
     zip_code: str,
+    merchant_id: str | int | None = None,
     overrides: dict | None = None,
 ) -> str:
-    """Create a store row for a merchant. Uses real coordinates from overrides when available."""
+    """Create a store row for a merchant. Geocodes the real store address when possible."""
     zip_lat, zip_lng, zip_city, zip_state = await asyncio.to_thread(_geocode_zip_sync, zip_code)
     ov = overrides or {}
+
+    if ov.get("lat") is not None:
+        lat, lng = float(ov["lat"]), float(ov["lng"])
+    else:
+        # Try to resolve the actual store location (not just zip centroid)
+        geo = await asyncio.to_thread(_geocode_store_sync, merchant_name or "", zip_code)
+        if geo:
+            lat, lng = geo
+        else:
+            # Zip centroid fallback — clustering handles visual overlap
+            lat, lng = zip_lat, zip_lng
+
     store = Store(
         chain=merchant_name or "Unknown",
         name=ov.get("name", merchant_name) or f"Store {zip_code}",
@@ -101,8 +262,9 @@ async def ensure_store_for_merchant(
         city=ov.get("city", zip_city or ""),
         state=ov.get("state", zip_state or ""),
         zip_code=zip_code,
-        latitude=ov.get("lat") if ov.get("lat") is not None else zip_lat,
-        longitude=ov.get("lng") if ov.get("lng") is not None else zip_lng,
+        latitude=lat,
+        longitude=lng,
+        flipp_merchant_id=str(merchant_id) if merchant_id is not None else None,
         is_active=True,
     )
     db.add(store)
@@ -178,6 +340,7 @@ async def ingest_deals_for_zip(zip_code: str):
         inserted = 0
         for deal_data in scored:
             merchant = deal_data.pop("_merchant_name", "Unknown")
+            merchant_id = deal_data.pop("_merchant_id", None)
             deal_data.pop("_flyer_id", None)
             deal_data.pop("store_id", None)
 
@@ -188,9 +351,21 @@ async def ingest_deals_for_zip(zip_code: str):
                 if key.startswith("_store_")
             }
 
-            store_id = await get_store_id_by_merchant(db, merchant, zip_code)
+            store_id = await get_store_id_by_merchant(
+                db,
+                merchant,
+                zip_code,
+                merchant_id=merchant_id,
+                coord_overrides=store_overrides,
+            )
             if not store_id:
-                store_id = await ensure_store_for_merchant(db, merchant, zip_code, overrides=store_overrides)
+                store_id = await ensure_store_for_merchant(
+                    db,
+                    merchant,
+                    zip_code,
+                    merchant_id=merchant_id,
+                    overrides=store_overrides,
+                )
 
             # Upsert by source_id
             source_id = deal_data.get("source_id")

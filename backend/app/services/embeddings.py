@@ -4,6 +4,27 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+# Richer context appended to the embed text per category so that natural-language
+# queries ("dental care", "indian food", "gluten free") land close to the right deals
+# even when the deal's raw title is short (e.g. "Colgate Total 6oz").
+_CATEGORY_CONTEXT: dict[str, str] = {
+    "household": (
+        "personal care hygiene oral care dental toothpaste toothbrush floss mouthwash whitening "
+        "shampoo conditioner body wash soap lotion deodorant razor cleaning detergent bleach "
+        "laundry dish paper towels toilet paper trash bags"
+    ),
+    "produce": "fresh fruits vegetables organic farm garden salad greens",
+    "meat": "protein fresh meat poultry seafood fish chicken beef pork",
+    "dairy": "dairy milk eggs cheese yogurt butter cream refrigerated",
+    "pantry": "grocery dry goods canned food cooking staples spices sauce rice pasta beans lentils",
+    "snacks": "snack chips crackers candy popcorn nuts granola bar treat",
+    "frozen": "frozen freezer aisle ice cream ready to eat convenience",
+    "beverages": "drink juice water soda coffee tea beverage refreshment",
+    "bakery": "baked goods bread pastry rolls muffin cake donut",
+    "deli": "prepared fresh deli rotisserie ready to eat",
+    "pet": "pet food dog cat animal care kibble treats",
+}
+
 _model = None
 
 
@@ -18,13 +39,18 @@ def _get_model():
 
 
 def build_embed_text(deal: dict) -> str:
-    """Build the text string that gets embedded for a deal dict."""
-    parts = [
-        deal.get("normalized_name") or deal.get("raw_title") or "",
-        deal.get("category") or "",
-        deal.get("brand") or "",
-        deal.get("raw_description") or "",
-    ]
+    """Build the text string that gets embedded for a deal dict.
+
+    Appends category-specific synonym context so that natural-language queries
+    ("dental care", "organic produce") land close to deals whose raw titles are
+    short product names with little semantic signal.
+    """
+    name = deal.get("normalized_name") or deal.get("raw_title") or ""
+    brand = deal.get("brand") or ""
+    description = deal.get("raw_description") or ""
+    category = deal.get("category") or ""
+    category_context = _CATEGORY_CONTEXT.get(category, "")
+    parts = [name, brand, description, category_context]
     return " ".join(p for p in parts if p).strip()
 
 

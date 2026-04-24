@@ -28,7 +28,7 @@ export function AskResults({ result }: AskResultsProps) {
   if (dealsWithObjects.length === 0 && !result.answer) return null;
 
   return (
-    <div className="shrink-0 border-b border-[var(--border)] bg-[var(--bg-elevated)] px-3 py-3 space-y-3">
+    <div className="border border-[var(--border)] bg-[var(--bg-elevated)] rounded-[var(--radius)] px-3 py-3 space-y-3 mb-3">
       {/* Answer */}
       <div className="flex items-start gap-2">
         <Sparkles size={13} className="text-[var(--green)] mt-0.5 shrink-0" />

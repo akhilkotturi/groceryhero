@@ -1,18 +1,17 @@
 "use client";
-import { useState, useEffect, useCallback, useMemo } from "react";
+import { useState, useEffect, useCallback, useMemo, useRef } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { motion, AnimatePresence } from "framer-motion";
 import {
   MapPin, LogOut, Zap, ShoppingCart, ListChecks,
   Loader2, Pencil, Check as CheckIcon, X as XIcon,
-  Search,
+  Search, Sparkles, LocateFixed,
 } from "lucide-react";
 import dynamic from "next/dynamic";
 
 import { DealCard } from "@/components/deals/DealCard";
 import { GroceryList } from "@/components/deals/GroceryList";
 import { DealModal } from "@/components/deals/DealModal";
-import { AskBar } from "@/components/deals/AskBar";
 import { AskResults } from "@/components/deals/AskResults";
 import type { AskResponse } from "@/types";
 import { useAuthStore } from "@/lib/store";
@@ -68,6 +67,15 @@ export default function DashboardPage() {
   const planStore = usePlanStore();
 
   const [location, setLocation] = useState({ lat: 30.2672, lng: -97.7431 });
+  // Tracks the user's actual GPS fix — green dot stays here regardless of map pan.
+  const [userGps, setUserGps] = useState<{ lat: number; lng: number } | null>(null);
+  // Explicit fly-to target: only updated on GPS success or zip submit, never on pan.
+  const [flyToTarget, setFlyToTarget] = useState({ lat: 30.2672, lng: -97.7431 });
+  const [locationMode, setLocationMode] = useState<"gps" | "zip">("zip");
+  const [locating, setLocating] = useState(false);
+  const locationRef = useRef(location);
+  useEffect(() => { locationRef.current = location; }, [location]);
+
   const [displayZip, setDisplayZip] = useState<string>(user?.zip_code ?? "");
   const [zipInput, setZipInput] = useState("");
   const [editingZip, setEditingZip] = useState(false);
@@ -86,6 +94,11 @@ export default function DashboardPage() {
   const [planLoading, setPlanLoading] = useState(false);
   const [planError, setPlanError] = useState<string | null>(null);
   const [askResult, setAskResult] = useState<AskResponse | null>(null);
+  const [aiMode, setAiMode] = useState(false);
+  const [aiLoading, setAiLoading] = useState(false);
+  const [aiError, setAiError] = useState<string | null>(null);
+
+  const [flyToKey, setFlyToKey] = useState(0);
 
   const handleStoreClick = useCallback((s: Store) => setSelectedStore(s), []);
 
@@ -98,26 +111,102 @@ export default function DashboardPage() {
     queryClient.invalidateQueries({ queryKey: ["stores"] });
   }, [queryClient]);
 
+  const handleMapMoveEnd = useCallback(
+    (center: { lat: number; lng: number }) => {
+      // Only refetch if the center moved >0.5km — zoom events fire moveend too
+      // but don't move the center, so this avoids unnecessary reloads.
+      // Uses locationRef (not location in closure) so this callback stays stable
+      // and the StoreMap moveend listener never captures a stale version.
+      const prev = locationRef.current;
+      if (Math.abs(center.lat - prev.lat) > 0.005 || Math.abs(center.lng - prev.lng) > 0.005) {
+        applyLocation(center);
+      }
+    },
+    [applyLocation]
+  );
+
+  const handleGoToMyLocation = useCallback(() => {
+    if (userGps) {
+      setFlyToTarget({ ...userGps });
+      setFlyToKey((k) => k + 1);
+      applyLocation(userGps);
+      return;
+    }
+
+    if (!navigator.geolocation) return;
+
+    setLocating(true);
+    navigator.geolocation.getCurrentPosition(
+      (pos) => {
+        const coords = { lat: pos.coords.latitude, lng: pos.coords.longitude };
+        setUserGps(coords);
+        setFlyToTarget(coords);
+        setFlyToKey((k) => k + 1);
+        setLocationMode("gps");
+        applyLocation(coords);
+        setLocating(false);
+      },
+      () => {
+        setLocating(false);
+      },
+      { timeout: 10000, enableHighAccuracy: true }
+    );
+  }, [applyLocation, userGps]);
+
+  const handleAiAsk = useCallback(async (q: string) => {
+    const trimmed = q.trim();
+    if (!trimmed || aiLoading) return;
+    setAiLoading(true);
+    setAiError(null);
+    try {
+      const { data } = await api.post<AskResponse>("/api/deals/ask", { query: trimmed });
+      setAskResult(data);
+    } catch (err: unknown) {
+      const msg = (err as { response?: { data?: { detail?: string } } })?.response?.data?.detail;
+      setAiError(msg ?? "AI search unavailable — try again");
+    } finally {
+      setAiLoading(false);
+    }
+  }, [aiLoading]);
+
   useEffect(() => {
     const init = async () => {
       if (navigator.geolocation) {
         navigator.geolocation.getCurrentPosition(
-          (pos) => applyLocation({ lat: pos.coords.latitude, lng: pos.coords.longitude }),
+          (pos) => {
+            const coords = { lat: pos.coords.latitude, lng: pos.coords.longitude };
+            setUserGps(coords);
+            setFlyToTarget(coords);
+            setLocationMode("gps");
+            applyLocation(coords);
+          },
           async () => {
             const zipCode = useAuthStore.getState().user?.zip_code;
             if (zipCode) {
               const coords = await geocodeZip(zipCode);
-              if (coords) applyLocation(coords, zipCode);
+              if (coords) {
+                setFlyToTarget(coords);
+                applyLocation(coords, zipCode);
+              }
             }
           },
           { timeout: 8000 }
         );
       } else if (user?.zip_code) {
         const coords = await geocodeZip(user.zip_code);
-        if (coords) applyLocation(coords, user.zip_code);
+        if (coords) {
+          setFlyToTarget(coords);
+          applyLocation(coords, user.zip_code);
+        }
       }
     };
     init();
+
+    // Kick off a background deal refresh on every page load so deals stay current
+    const zip = useAuthStore.getState().user?.zip_code;
+    if (zip) {
+      api.post("/api/admin/ingest", { zip_codes: [zip] }).catch(() => {});
+    }
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -130,6 +219,9 @@ export default function DashboardPage() {
     const coords = await geocodeZip(z);
     if (!coords) { setZipError(true); return; }
     applyLocation(coords, z);
+    setFlyToTarget(coords);
+    setUserGps(null);
+    setLocationMode("zip");
     setEditingZip(false);
     try {
       const { data } = await api.patch("/api/users/me", { zip_code: z });
@@ -188,10 +280,11 @@ export default function DashboardPage() {
       const { data } = await api.get(`/api/deals/search?${params}`);
       return data;
     },
-    enabled: debouncedQuery.length >= 2,
+    enabled: debouncedQuery.length >= 2 && !aiMode,
   });
 
-  const isSearching = debouncedQuery.length >= 2;
+  // In AI mode the input drives the AI call, not the live search
+  const isSearching = !aiMode && debouncedQuery.length >= 2;
   const dealsLoading = isSearching ? searchLoading : nearbyLoading;
   const rawDeals: Deal[] = isSearching
     ? (searchData?.deals ?? [])
@@ -271,26 +364,69 @@ export default function DashboardPage() {
           </span>
         </div>
 
-        {/* Search bar */}
+        {/* Unified search bar */}
         <div className="flex-1 flex justify-center">
           <div className="relative w-full max-w-[500px]">
-            <Search size={15} className="absolute left-3 top-1/2 -translate-y-1/2 text-[var(--text-muted)]" />
+            {/* Left icon */}
+            {aiMode
+              ? <Sparkles size={15} className="absolute left-3 top-1/2 -translate-y-1/2 text-[var(--green)] pointer-events-none" />
+              : <Search size={15} className="absolute left-3 top-1/2 -translate-y-1/2 text-[var(--text-muted)] pointer-events-none" />
+            }
             <input
               type="text"
               value={searchQuery}
-              onChange={(e) => setSearchQuery(e.target.value)}
-              placeholder="Search deals… e.g. chicken, milk, eggs"
-              className="w-full pl-9 pr-4 py-2 bg-[var(--bg-elevated)] border border-[var(--green)] rounded-xl text-sm text-[var(--text-primary)] placeholder:text-[var(--text-muted)] focus:outline-none focus:ring-1 focus:ring-[var(--green)] transition-colors"
+              onChange={(e) => {
+                setSearchQuery(e.target.value);
+                if (aiMode) { setAskResult(null); setAiError(null); }
+              }}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" && aiMode) {
+                  e.preventDefault();
+                  handleAiAsk(searchQuery);
+                }
+              }}
+              placeholder={aiMode
+                ? "Ask AI: cheapest chicken, organic deals under $3…"
+                : "Search deals… e.g. chicken, milk, eggs"
+              }
+              className={cn(
+                "w-full pl-9 pr-16 py-2 rounded-xl text-sm text-[var(--text-primary)] placeholder:text-[var(--text-muted)] focus:outline-none transition-colors",
+                aiMode
+                  ? "bg-[var(--green-glow)] border border-[var(--green)] focus:ring-1 focus:ring-[var(--green)]"
+                  : "bg-[var(--bg-elevated)] border border-[var(--border)] focus:border-[var(--green)]"
+              )}
             />
-            {searchQuery && (
+            {/* Right controls */}
+            <div className="absolute right-2 top-1/2 -translate-y-1/2 flex items-center gap-1">
+              {aiLoading && <Loader2 size={13} className="text-[var(--green)] animate-spin" />}
+              {searchQuery && !aiLoading && (
+                <button
+                  aria-label="Clear search"
+                  onClick={() => { setSearchQuery(""); setAskResult(null); setAiError(null); }}
+                  className="text-[var(--text-muted)] hover:text-[var(--text-secondary)] p-0.5"
+                >
+                  <XIcon size={13} />
+                </button>
+              )}
+              {/* AI toggle */}
               <button
-                aria-label="Clear search"
-                onClick={() => setSearchQuery("")}
-                className="absolute right-3 top-1/2 -translate-y-1/2 text-[var(--text-muted)] hover:text-[var(--text-secondary)]"
+                aria-label={aiMode ? "Disable AI search" : "Enable AI search"}
+                onClick={() => {
+                  setAiMode((m) => !m);
+                  setAskResult(null);
+                  setAiError(null);
+                }}
+                title={aiMode ? "AI mode on — press Enter to search" : "Switch to AI search"}
+                className={cn(
+                  "p-1.5 rounded-lg transition-colors",
+                  aiMode
+                    ? "bg-[var(--green)] text-black"
+                    : "text-[var(--text-muted)] hover:text-[var(--green)] hover:bg-[var(--green-glow)]"
+                )}
               >
-                <XIcon size={13} />
+                <Sparkles size={13} />
               </button>
-            )}
+            </div>
           </div>
         </div>
 
@@ -320,7 +456,7 @@ export default function DashboardPage() {
               </form>
             ) : (
               <button onClick={() => { setZipInput(displayZip); setEditingZip(true); }} className="flex items-center gap-1 group">
-                <span>{displayZip || "set zip"}</span>
+                <span>{locationMode === "gps" ? "GPS" : (displayZip || "set zip")}</span>
                 <Pencil size={10} className="text-[var(--text-muted)] opacity-0 group-hover:opacity-100 transition-opacity" />
               </button>
             )}
@@ -455,16 +591,6 @@ export default function DashboardPage() {
                 </div>
               </div>
 
-              {/* AI Ask bar */}
-              <AskBar
-                onResult={setAskResult}
-                onClear={() => setAskResult(null)}
-                hasResult={askResult !== null}
-              />
-
-              {/* AI results (shown above deal grid when active) */}
-              {askResult && <AskResults result={askResult} />}
-
               {/* Store filter banner */}
               {selectedStore && (
                 <div className="px-4 py-2 bg-[var(--green-glow)] border-b border-[var(--border)] flex items-center justify-between shrink-0">
@@ -490,6 +616,13 @@ export default function DashboardPage() {
 
               {/* Deal grid */}
               <div className="flex-1 overflow-y-auto p-3">
+                {aiError && (
+                  <div className="mb-3 px-3 py-2 rounded-lg bg-red-500/10 border border-red-500/30 text-xs text-red-400">
+                    {aiError}
+                  </div>
+                )}
+                {askResult && <AskResults result={askResult} />}
+
                 {dealsLoading ? (
                   <div className="grid grid-cols-2 gap-3">
                     {Array.from({ length: 10 }).map((_, i) => (
@@ -582,17 +715,30 @@ export default function DashboardPage() {
         </div>
 
         {/* Map */}
-        <div className="flex-1 p-4">
+        <div className="flex-1 p-4 relative">
           <StoreMap
             stores={stores}
             deals={rawDeals}
-            userLat={location.lat}
-            userLng={location.lng}
+            userLat={userGps?.lat ?? location.lat}
+            userLng={userGps?.lng ?? location.lng}
+            flyToLat={flyToTarget.lat}
+            flyToLng={flyToTarget.lng}
+            flyToKey={flyToKey}
             onStoreClick={activeTab === "browse" ? handleStoreClick : undefined}
+            onMapMoveEnd={handleMapMoveEnd}
             selectedStoreId={activeTab === "browse" ? (selectedStore?.id ?? null) : null}
             planStoreIds={activeTab === "plan" && planStoreIds.size > 0 ? planStoreIds : undefined}
             planRoute={activeTab === "plan" ? planRouteStores : undefined}
           />
+          <button
+            onClick={handleGoToMyLocation}
+            title="Go to my location"
+            aria-label="Go to my location"
+            disabled={locating}
+            className="absolute bottom-8 right-8 w-9 h-9 rounded-full bg-[var(--bg-elevated)] border border-[var(--border)] text-[var(--green)] shadow-lg hover:bg-[var(--bg-card)] hover:border-[var(--green)] transition-colors flex items-center justify-center z-10 disabled:opacity-60 disabled:cursor-not-allowed"
+          >
+            {locating ? <Loader2 size={15} className="animate-spin" /> : <LocateFixed size={15} />}
+          </button>
         </div>
       </div>
 
