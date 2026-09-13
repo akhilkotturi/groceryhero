@@ -15,10 +15,9 @@ from typing import Any
 
 import httpx
 
-logger = logging.getLogger(__name__)
+from app.core.config import settings
 
-# Target's public PWA API key (hardcoded in their web app bundle)
-_TARGET_API_KEY = "REMOVED_TARGET_API_KEY"
+logger = logging.getLogger(__name__)
 
 _GROCERY_SEARCHES = [
     ("grocery sale", "/c/grocery/-/N-5xt1a"),
@@ -34,7 +33,7 @@ _HEADERS = {
         "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
     ),
     "Accept": "application/json",
-    "X-Api-Key": _TARGET_API_KEY,
+    "X-Api-Key": settings.TARGET_API_KEY,
 }
 
 

@@ -46,7 +46,7 @@ services:
       - "5432:5432"
     environment:
       POSTGRES_USER: groceryhero
-      POSTGRES_PASSWORD: groceryhero_secret
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in your environment}
       POSTGRES_DB: groceryhero
     volumes:
       - postgres_data:/var/lib/postgresql/data

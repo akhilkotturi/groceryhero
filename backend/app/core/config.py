@@ -25,6 +25,9 @@ class Settings(BaseSettings):
     KROGER_CLIENT_ID: str = ""
     KROGER_CLIENT_SECRET: str = ""
 
+    # Target Redsky API public web-app key
+    TARGET_API_KEY: str = ""
+
     # AI — Groq API key for semantic deal matching
     GROQ_API_KEY: str = ""
 
